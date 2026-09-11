@@ -96,6 +96,12 @@ Each message gets an invisible `<acp>` ref tag (`m00001`, `m00002`, ...) visible
 
 Pi's built-in auto-compaction is cancelled — billion-context is the sole context manager.
 
+## Read-only context integration API
+
+Compatible Pi extensions can acquire a bounded, session-bound ACP text projection and retrieve disclosed original evidence without accessing ACP state or invoking mutating tools. The interface is for trusted extension hosts; it is not exposed directly to a model and is not a general filesystem or session-reading API.
+
+The API is currently a **development-build contract**. A consumer and ACP build that use it must be deployed and validated together. See [Read-only context integration API](docs/readonly-context.md) for the event contract, immutable snapshot semantics, disclosure requirements, lifecycle handling, and hard limits.
+
 ## Plugin compatibility & ordering
 
 billion-context takes over context management by intercepting Pi's `context` event. **Pi has no plugin priority mechanism** — when multiple extensions register handlers for the same event, they run in a fixed sequence (load order), with no `priority`/`weight` field and no way for the user to control the order. The `context` event specifically is a *pipeline*: every handler receives the previous handler's output, there is no short-circuit, and the **last** handler has the final say over what reaches the model.
