@@ -48,8 +48,9 @@ function piCtx(notify: Notify, baseUrl: string | undefined, hasUI = true) {
   };
 }
 
-const startSession = (handlers: any, ctx: any) =>
-  handlers.get("session_start")![0]!({ type: "session_start", reason: "startup" }, ctx);
+const startSession = async (handlers: ReturnType<typeof captureApi>["handlers"], ctx: ReturnType<typeof piCtx>) => {
+  for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
+};
 
 const PROXIED_BASE_URL = "http://127.0.0.1:8787/bili/https://api.openai.com/v1";
 
@@ -89,7 +90,7 @@ describe("proxied baseUrl stand-down (#296)", () => {
     assert.equal(notes[0]!.msg, PROXY_STAND_DOWN_MESSAGE);
     assert.equal(notes[0]!.type, "warning");
     // Stands down: does not cancel the host's own compaction (the proxy owns compression).
-    assert.equal(handlers.get("session_before_compact")![0]!({}, {}), undefined);
+    assert.ok(handlers.get("session_before_compact")!.every((handler) => handler({}, {}) === undefined));
     // Does not inject the ACP system prompt (model must not learn compress here).
     assert.equal(handlers.get("before_agent_start")![0]!({ systemPrompt: "BASE" }, {}), undefined);
     // Leaves the context untouched (no ref tags / nudge) — returns undefined.
@@ -156,7 +157,7 @@ describe("proxied baseUrl stand-down (#296)", () => {
     await startSession(handlers, ctx);
 
     assert.equal(notes.filter((m) => m === PROXY_STAND_DOWN_MESSAGE).length, 0, "no stand-down warning on a direct endpoint");
-    assert.deepEqual(handlers.get("session_before_compact")![0]!({}, {}), { cancel: true });
+    assert.ok(handlers.get("session_before_compact")!.some((handler) => handler({}, {})?.cancel === true));
     const sp = handlers.get("before_agent_start")![0]!({ systemPrompt: "BASE" }, {});
     assert.ok(sp.systemPrompt.startsWith("BASE"));
     assert.ok(sp.systemPrompt.includes("compress"));

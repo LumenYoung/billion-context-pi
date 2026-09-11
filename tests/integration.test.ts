@@ -73,8 +73,7 @@ function userMsg(id: string, text: string) {
 test("session_before_compact cancels Pi's auto-compaction", () => {
   const { api, handlers } = captureApi();
   createAcpExtension()(api as any);
-  const result = handlers.get("session_before_compact")![0]!({}, {});
-  assert.deepEqual(result, { cancel: true });
+  assert.ok(handlers.get("session_before_compact")!.some((handler) => handler({}, {})?.cancel === true));
 });
 
 test("before_agent_start appends the ACP system prompt", () => {

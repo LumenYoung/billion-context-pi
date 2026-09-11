@@ -66,8 +66,9 @@ function piCtx(notify: Notify) {
   };
 }
 
-const startSession = (handlers: any, ctx: any) =>
-  handlers.get("session_start")![0]!({ type: "session_start", reason: "startup" }, ctx);
+const startSession = async (handlers: ReturnType<typeof captureApi>["handlers"], ctx: ReturnType<typeof ompCtx>) => {
+  for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
+};
 
 describe("OMP host refusal (issue #234)", () => {
   test("detects OMP at session_start, refuses service, warns once via UI", async () => {
@@ -84,7 +85,7 @@ describe("OMP host refusal (issue #234)", () => {
     assert.equal(notes[0]!.type, "warning");
 
     // Stands down: does not cancel the host's own compaction.
-    assert.equal(handlers.get("session_before_compact")![0]!({}, {}), undefined);
+    assert.ok(handlers.get("session_before_compact")!.every((handler) => handler({}, {}) === undefined));
     // Does not inject the ACP system prompt (model must not learn compress here).
     assert.equal(handlers.get("before_agent_start")![0]!({ systemPrompt: "BASE" }, {}), undefined);
     // Leaves the context untouched (no ref tags / nudge) — returns undefined.
@@ -153,7 +154,7 @@ describe("OMP host refusal (issue #234)", () => {
     await startSession(handlers, ctx);
 
     assert.equal(notes.filter((m) => m === OMP_UNSUPPORTED_MESSAGE).length, 0, "no OMP warning on a pi host");
-    assert.deepEqual(handlers.get("session_before_compact")![0]!({}, {}), { cancel: true });
+    assert.ok(handlers.get("session_before_compact")!.some((handler) => handler({}, {})?.cancel === true));
     const sp = handlers.get("before_agent_start")![0]!({ systemPrompt: "BASE" }, {});
     assert.ok(sp.systemPrompt.startsWith("BASE"));
     assert.ok(sp.systemPrompt.includes("compress"));
