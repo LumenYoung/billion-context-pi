@@ -62,6 +62,8 @@ import { findPiSubagentsInstalls, resolveAgentDir, DELEGATE_STAND_DOWN_MESSAGE }
 export { createRuntime } from "./runtime.js";
 export type { AcpRuntime, SessionRef } from "./runtime.js";
 export { deriveChildState } from "./state.js";
+import { wireReadonlyContext, type ReadonlyContextBridge } from "./readonly-bridge.js";
+export * from "./readonly-context.js";
 
 type AgentMessage = SessionMessageEntry["message"];
 
@@ -78,6 +80,7 @@ export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactor
       return;
     }
     const runtime = createRuntime(adapter);
+    const readonlyContext = wireReadonlyContext(pi);
     // Double-compression guards (#296, #461): exactly one side may own
     // compression. Three signals, ALL checked lazily on every event because
     // none can be trusted at factory time:
@@ -119,7 +122,7 @@ export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactor
     wireCompactionDisable(pi, runtime);
     wireDelegateReadTracking(pi);
     wireSessionLifecycle(pi, runtime, standDownIfProxied);
-    wireContextTransform(pi, runtime, standDownIfProxied);
+    wireContextTransform(pi, runtime, standDownIfProxied, readonlyContext);
     wireBeforeProviderRequest(pi, runtime, standDownIfProxied);
     wireSystemPrompt(pi, runtime);
     wireToolGuardrails(pi, runtime);
@@ -406,15 +409,16 @@ function wireBeforeProviderRequest(pi: ExtensionAPI, runtime: AcpRuntime, standD
 // The core integration: Pi's `context` event fires before every LLM call with the
 // messages about to be sent. We run acp-kernel's processTurn (prune + ref-tag +
 // nudge decision) and return the transformed AgentMessage[].
-function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIfProxied: (ctx: ExtensionContext) => boolean): void {
+function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIfProxied: (ctx: ExtensionContext) => boolean, readonlyContext: ReadonlyContextBridge): void {
   pi.on("context", async (event, ctx) => {
+    const generation = readonlyContext.begin(ctx.sessionManager.getSessionId());
     // Refused host (OMP / proxied baseUrl): leave the context completely
     // untouched — no ref tags, no compression, no nudge. Returning undefined
     // makes pi send the original messages verbatim.
-    if (runtime.refused) return;
+    if (runtime.refused) { readonlyContext.invalidate(); return; }
     // Fallback for hosts where session_start did not fire before the first LLM
     // call: detect the proxied baseUrl here instead.
-    if (standDownIfProxied(ctx)) return;
+    if (standDownIfProxied(ctx)) { readonlyContext.invalidate(); return; }
     const sid = ctx.sessionManager.getSessionId();
     const release = await runtime.acquireLock(sid);
     try {
@@ -935,8 +939,17 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       if (ctx.hasUI) ctx.ui.notify(msg);
     });
     if (!ctx.hasUI) await updateCheck;
+    if (runtime.adapter.enabled !== false) {
+      readonlyContext.capture(sid, generation, {
+        originals: coreMessages, originalMessages: originalById, transformed: turn.messages, output: rebuilt, state: turn.state,
+        unattributedIds: new Set(entries.filter((entry) => entry.type !== "message").map((entry) => entry.id)),
+      });
+    } else {
+      readonlyContext.invalidate();
+    }
     return { messages: rebuilt };
     } catch (e) {
+      readonlyContext.invalidate();
       logThrow("context", e, { sid, phase: "transform" });
       throw e;
     } finally {
