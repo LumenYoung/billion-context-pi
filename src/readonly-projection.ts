@@ -1,12 +1,13 @@
 import type { SessionMessageEntry } from "@earendil-works/pi-coding-agent";
 import type { CompressionState, CoreMessage } from "acp-kernel";
 import { randomUUID } from "node:crypto";
+import { ReadonlyBudget, readonlyJsonBytes, readonlyRecordBytes } from "./readonly-budget.js";
 import { ACP_READONLY_LIMITS as limits, AcpReadonlyError, type AcpReadonlyRecord, type AcpReadonlySnapshot } from "./readonly-context.js";
 
 export interface ReadonlyCapture {
   readonly snapshot: AcpReadonlySnapshot;
   readonly context: readonly AcpReadonlyRecord[];
-  readonly evidence: readonly AcpReadonlyRecord[];
+  readonly evidence: readonly (AcpReadonlyRecord | null)[];
   readonly targets: ReadonlyMap<string, readonly number[]>;
 }
 
@@ -18,45 +19,36 @@ export function frozenRecord(record: AcpReadonlyRecord): AcpReadonlyRecord {
   return Object.freeze({ ...record, refs: Object.freeze([...record.refs]), toolNames: Object.freeze([...record.toolNames]) });
 }
 
-function jsonArguments(value: unknown): string {
-  const pending: { value: unknown; exit?: boolean }[] = [{ value }];
-  const seen = new WeakSet<object>();
-  let bytes = 0;
-  let nodes = 0;
-  while (pending.length) {
-    const frame = pending.pop()!;
-    const item = frame.value;
-    if (frame.exit && item && typeof item === "object") { seen.delete(item); continue; }
-    if (++nodes > limits.records || bytes > limits.captureBytes) throw new AcpReadonlyError("budget_exceeded");
-    if (typeof item === "string") bytes += Buffer.byteLength(item);
-    else if (item && typeof item === "object") {
-      if (seen.has(item)) throw new AcpReadonlyError("invalid_request");
-      seen.add(item);
-      pending.push({ value: item, exit: true });
-      for (const key in item) {
-        if (!Object.hasOwn(item, key)) continue;
-        bytes += Buffer.byteLength(key) + 8;
-        if (pending.length >= limits.records || bytes > limits.captureBytes) throw new AcpReadonlyError("budget_exceeded");
-        pending.push({ value: (item as Record<string, unknown>)[key] });
-      }
-    }
-  }
-  if (bytes > limits.captureBytes) throw new AcpReadonlyError("budget_exceeded");
-  const text = JSON.stringify(value) ?? "";
-  if (Buffer.byteLength(text) > limits.captureBytes) throw new AcpReadonlyError("budget_exceeded");
-  return text;
-}
-
-function messageText(message: SessionMessageEntry["message"]): string {
-  const msg = message as { content?: unknown };
-  if (typeof msg.content === "string") return msg.content;
+function messageText(value: unknown, work: ReadonlyBudget): string {
+  const message = value as { content?: unknown };
   const parts: string[] = [];
-  if (Array.isArray(msg.content)) {
-    for (const part of msg.content) {
+  let bytes = 0;
+  const append = (...segments: string[]): void => {
+    let size = parts.length ? 1 : 0;
+    work.charge(size);
+    for (const text of segments) {
+      if (text.length > limits.recordBytes - bytes - size) throw new AcpReadonlyError("budget_exceeded");
+      work.charge(text.length);
+      const textBytes = Buffer.byteLength(text);
+      work.charge(textBytes - text.length);
+      size += textBytes;
+      if (size > limits.recordBytes - bytes) throw new AcpReadonlyError("budget_exceeded");
+    }
+    bytes += size;
+    parts.push(segments.join(""));
+  };
+  if (typeof message.content === "string") append(message.content);
+  else if (Array.isArray(message.content)) {
+    if (message.content.length > limits.records) throw new AcpReadonlyError("budget_exceeded");
+    for (const part of message.content) {
+      work.visit();
       if (!part || typeof part !== "object") continue;
       const item = part as { type?: string; text?: string; name?: string; arguments?: unknown };
-      if (item.type === "text" && typeof item.text === "string") parts.push(item.text);
-      if (item.type === "toolCall") parts.push(`${item.name ?? "tool"}: ${jsonArguments(item.arguments)}`);
+      if (item.type === "text" && typeof item.text === "string") append(item.text);
+      if (item.type === "toolCall") {
+        readonlyJsonBytes(item.arguments, limits.recordBytes - bytes, work);
+        append(item.name ?? "tool", ": ", JSON.stringify(item.arguments) ?? "");
+      }
     }
   }
   return parts.join("\n");
@@ -74,17 +66,24 @@ export function captureReadonlyProjection(input: {
   now?: number;
 }): ReadonlyCapture {
   const { originals, transformed, output, state } = input;
-  let bytes = 0;
-  const charge = (value: unknown): void => {
-    bytes += Buffer.byteLength(jsonArguments(value));
-    if (bytes > limits.captureBytes) throw new AcpReadonlyError("budget_exceeded");
-  };
-  if (originals.length + output.length + state.blocks.length > limits.records) throw new AcpReadonlyError("budget_exceeded");
-  // Account source strings and coverage metadata before allocating derived copies.
-  for (const core of originals) charge(core);
-  for (const block of state.blocks) charge(block);
+  const metadata = new ReadonlyBudget(limits.metadataBytes);
+  const historyWork = new ReadonlyBudget(limits.historyBytes);
+  const currentWork = new ReadonlyBudget(limits.captureBytes);
+  let historyBytes = 0;
+  let currentBytes = 0;
+  const chargeMetadata = (value: unknown): void => { readonlyJsonBytes(value, limits.metadataBytes, metadata); };
+  if (originals.length + output.length + state.blocks.length + transformed.length > limits.records) throw new AcpReadonlyError("budget_exceeded");
+  for (const core of originals) chargeMetadata([core.id, core.role, core.contentType, core.toolName, core.toolCallId, state.messageRefs.byRaw[core.id]]);
+  for (const core of transformed) chargeMetadata(core.id);
+  for (const block of state.blocks) {
+    if (typeof block.blockId !== "string" || !Array.isArray(block.effectiveMessageIds) || !Array.isArray(block.directBlockIds)) throw new AcpReadonlyError("invalid_request");
+    if (block.effectiveMessageIds.length + block.directBlockIds.length > limits.records) throw new AcpReadonlyError("budget_exceeded");
+    if (!block.effectiveMessageIds.every((id) => typeof id === "string") || !block.directBlockIds.every((id) => typeof id === "string")) throw new AcpReadonlyError("invalid_request");
+    chargeMetadata([block.blockId, block.compressCallId, block.effectiveMessageIds, block.directBlockIds]);
+  }
   const byId = new Map(originals.map((core) => [core.id, core]));
   const blocks = new Map(state.blocks.map((block) => [block.blockId, block]));
+  if (blocks.size !== state.blocks.length || byId.size !== originals.length) throw new AcpReadonlyError("invalid_request");
   const callBlocks = new Map<string, string[]>();
   for (const block of state.blocks) {
     if (!block.compressCallId) continue;
@@ -92,10 +91,19 @@ export function captureReadonlyProjection(input: {
     ids.push(block.blockId);
     callBlocks.set(block.compressCallId, ids);
   }
-  const union = (parts: Provenance[]): Provenance => ({
-    toolNames: [...new Set(parts.flatMap((part) => part.toolNames))].sort(),
-    provenanceComplete: parts.length > 0 && parts.every((part) => part.provenanceComplete),
-  });
+  const union = (parts: Provenance[]): Provenance => {
+    const names = new Set<string>();
+    let complete = parts.length > 0;
+    for (const part of parts) {
+      metadata.visit();
+      complete &&= part.provenanceComplete;
+      for (const name of part.toolNames) {
+        metadata.visit();
+        if (!names.has(name)) { metadata.charge(Buffer.byteLength(name)); names.add(name); }
+      }
+    }
+    return { toolNames: [...names].sort(), provenanceComplete: complete };
+  };
   const unknown: Provenance = { toolNames: [], provenanceComplete: false };
   const provenanceCache = new Map<string, Provenance>();
   const visiting = new Set<string>();
@@ -103,7 +111,9 @@ export function captureReadonlyProjection(input: {
     const cached = provenanceCache.get(id);
     if (cached) return cached;
     const block = blocks.get(id);
-    if (!block || visiting.has(id) || visiting.size >= 64) return unknown;
+    if (!block) return unknown;
+    if (visiting.has(id)) throw new AcpReadonlyError("invalid_request");
+    if (visiting.size >= limits.metadataDepth) throw new AcpReadonlyError("budget_exceeded");
     visiting.add(id);
     const parts = block.effectiveMessageIds.map((raw) => coreProvenance(byId.get(raw)));
     parts.push(...block.directBlockIds.map(blockProvenance));
@@ -128,16 +138,24 @@ export function captureReadonlyProjection(input: {
     group.push(core);
     grouped.set(baseId(core.id), group);
   }
-  const evidence: AcpReadonlyRecord[] = [];
+  const evidence: (AcpReadonlyRecord | null)[] = [];
   const targets = new Map<string, readonly number[]>();
   const rawIndexes = new Map<string, number>();
   const refsFor = (cores: readonly CoreMessage[], index: number): string[] => cores.map((core, i) => {
     const ref = state.messageRefs.byRaw[core.id];
     return ref && /^m\d+$/.test(ref) ? ref : `o${index}_${i}`;
   });
-  const add = (record: AcpReadonlyRecord): AcpReadonlyRecord => {
-    charge(record);
-    return frozenRecord(record);
+  const historical = (project: () => AcpReadonlyRecord): AcpReadonlyRecord | null => {
+    try {
+      const record = project();
+      const size = readonlyRecordBytes(record);
+      if (size > limits.historyBytes - historyBytes) throw new AcpReadonlyError("budget_exceeded");
+      historyBytes += size;
+      return frozenRecord(record);
+    } catch (error) {
+      if (error instanceof AcpReadonlyError && error.code === "budget_exceeded") return null;
+      throw error;
+    }
   };
   for (const cores of grouped.values()) {
     const first = cores[0]!;
@@ -145,8 +163,12 @@ export function captureReadonlyProjection(input: {
     const refs = refsFor(cores, index);
     const kind = first.contentType === "tool-call" || first.contentType === "tool-result" ? first.contentType : first.role === "user" ? "user" : "assistant";
     const original = input.originalMessages.get(baseId(first.id));
-    const text = (original ? messageText(original) : "") || cores.map((core) => core.text ?? "").join("\n");
-    const record = add({ ref: refs[0]!, refs, kind, text, ...union(cores.map(coreProvenance)) });
+    const provenance = union(cores.map(coreProvenance));
+    chargeMetadata([refs, provenance]);
+    const record = historical(() => {
+      const text = (original ? messageText(original, historyWork) : "") || messageText({ content: cores.map((core) => ({ type: "text", text: core.text ?? "" })) }, historyWork);
+      return { ref: refs[0]!, refs, kind, text, ...provenance };
+    });
     evidence.push(record);
     for (const ref of refs) {
       if (targets.has(ref)) throw new AcpReadonlyError("invalid_request");
@@ -157,7 +179,8 @@ export function captureReadonlyProjection(input: {
   for (const block of state.blocks) {
     if (!/^b\d+$/.test(block.blockId)) throw new AcpReadonlyError("invalid_request");
     const provenance = blockProvenance(block.blockId);
-    evidence.push(add({ ref: block.blockId, refs: [block.blockId], kind: "summary", text: block.topic ? `${block.topic}\n${block.summary}` : block.summary, ...provenance }));
+    chargeMetadata(provenance);
+    evidence.push(historical(() => ({ ref: block.blockId, refs: [block.blockId], kind: "summary", text: messageText({ content: [...(block.topic ? [{ type: "text", text: block.topic }] : []), { type: "text", text: block.summary }] }, historyWork), ...provenance })));
     const indexes = block.effectiveMessageIds.map((raw) => rawIndexes.get(raw));
     if (indexes.length && indexes.every((index): index is number => index !== undefined)) {
       targets.set(block.blockId, Object.freeze([...new Set(indexes)].sort((a, b) => a - b)));
@@ -170,14 +193,17 @@ export function captureReadonlyProjection(input: {
     if (msg.role === "system") continue;
     const cores = grouped.get(outputIds[index] ?? "");
     const refs = cores ? refsFor(cores, rawIndexes.get(cores[0]!.id)!) : [`s${index}`];
-    const text = messageText(message);
+    const text = messageText(message, currentWork);
     const kind = !cores ? "synthetic" : msg.role === "toolResult" ? "tool-result" : cores.some((core) => core.contentType === "tool-call") ? "tool-call" : msg.role === "assistant" ? "assistant" : "user";
     const provenance = cores ? union(cores.map(coreProvenance)) : unknown;
-    context.push(add({ ref: refs[0]!, refs, kind, text, ...provenance }));
+    const record: AcpReadonlyRecord = { ref: refs[0]!, refs, kind, text, ...provenance };
+    currentBytes += readonlyRecordBytes(record);
+    if (currentBytes > limits.captureBytes) throw new AcpReadonlyError("budget_exceeded");
+    context.push(frozenRecord(record));
   }
-  for (const [ref, indexes] of targets) charge([ref, indexes]);
+  for (const [ref, indexes] of targets) chargeMetadata([ref, indexes]);
   const createdAt = input.now ?? Date.now();
   const snapshot = Object.freeze({ id: randomUUID(), sessionId: input.sessionId, generation: input.generation, createdAt, expiresAt: createdAt + limits.lifetimeMs, fidelity: "acp-text-projection" as const });
-  charge(snapshot);
+  chargeMetadata(snapshot);
   return Object.freeze({ snapshot, context: Object.freeze(context), evidence: Object.freeze(evidence), targets });
 }

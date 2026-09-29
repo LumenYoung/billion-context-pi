@@ -41,7 +41,7 @@ test("transitive block and compress-anchor disclosure fails closed, including un
   const input = fixture();
   input.state.blocks.push({ ...input.state.blocks[0]!, blockId: "b2", directBlockIds: ["b1"], summary: "nested secret", compressCallId: "nested" });
   const projection = captureReadonlyProjection({ ...input, sessionId: "session-a", generation: 1 });
-  assert.deepEqual(projection.evidence.find((record) => record.ref === "b2")!.toolNames, ["bash"]);
+  assert.deepEqual(projection.evidence.find((record) => record?.ref === "b2")!.toolNames, ["bash"]);
   assert.ok(projection.context.filter((record) => record.toolNames.includes("compress")).every((record) => record.toolNames.includes("bash")));
   const sanitizer = (record: AcpReadonlyRecord): string | null => !record.provenanceComplete || record.toolNames.includes("bash") ? null : record.text;
   const lease = await acquire(capture(input), { sanitize: sanitizer });
@@ -53,7 +53,7 @@ test("transitive block and compress-anchor disclosure fails closed, including un
   } finally { lease.release(); }
   input.state.blocks[0]!.effectiveMessageIds.push("missing-original");
   const unknown = captureReadonlyProjection({ ...input, sessionId: "session-a", generation: 2 });
-  assert.equal(unknown.evidence.find((record) => record.ref === "b1")!.provenanceComplete, false);
+  assert.equal(unknown.evidence.find((record) => record?.ref === "b1")!.provenanceComplete, false);
   assert.equal(unknown.targets.has("b1"), false);
 });
 
@@ -62,10 +62,11 @@ test("sanitization precedes initial payload, search, and UTF-8 bounded pages, in
   const calls: string[] = [];
   const lease = await acquire(capture(fixture(text)), { sanitize: (record) => { calls.push(record.text); return record.text.replaceAll("password=secret-secret", "[REDACTED]"); } });
   try {
-    assert.ok(calls.some((value) => value.includes(text)));
+    assert.ok(!calls.some((value) => value.includes(text)));
     const context = await lease.context({ maxBytes: 1024 });
     assert.ok(!JSON.stringify(context).includes("secret-secret"));
     assert.deepEqual((await lease.search({ query: "secret-secret" })).records, []);
+    assert.ok(calls.some((value) => value.includes(text)));
     let cursor: string | undefined;
     let combined = "";
     do {
@@ -146,7 +147,10 @@ test("clear absent/version/invalid errors, cancellation and concurrent lease/req
 
 test("capture and lease byte/request/TTL budgets are enforced without file fallback", async (t) => {
   const bridge = capture(fixture("x".repeat(limits.captureBytes + 1)));
-  assert.deepEqual(await bridge.acquire(request()), { ok: false, error: "budget_exceeded" });
+  const oversized = await acquire(bridge);
+  assert.ok((await oversized.context()).records.length);
+  await assert.rejects(oversized.decompress({ ref: "b1" }), code("budget_exceeded"));
+  oversized.release();
   const lease = await acquire(capture(fixture("x".repeat(180000))));
   let exhausted = false;
   for (let i = 0; i < 12; i++) {
@@ -184,7 +188,7 @@ test("projection preserves multi-call assistant prose, omits images and unsuppor
   const message = assistant([{ type: "text", text: "MULTI_CALL_PROSE" }, { type: "toolCall", name: "read", id: "one", arguments: { path: "safe" } }, { type: "toolCall", name: "bash", id: "two", arguments: { command: "echo" } }, { type: "image", data: "NEVER_IMAGE" }]);
   input.originalMessages.set("answer", message);
   const projection = captureReadonlyProjection({ ...input, unattributedIds: new Set(["answer"]), sessionId: "session-a", generation: 1 });
-  const record = projection.evidence.find((record) => record.text.includes("MULTI_CALL_PROSE"))!;
+  const record = projection.evidence.find((record) => record?.text.includes("MULTI_CALL_PROSE"))!;
   assert.ok(record);
   assert.equal(record.provenanceComplete, false);
   assert.ok(!JSON.stringify(projection.context).includes("NEVER_IMAGE"));

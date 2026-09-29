@@ -2,6 +2,12 @@ export const ACP_READONLY_CONTEXT_EVENT = "billion-context-pi:readonly-context:v
 export const ACP_READONLY_CONTEXT_VERSION = 1;
 export const ACP_READONLY_LIMITS = Object.freeze({
   captureBytes: 8 * 1024 * 1024,
+  historyBytes: 64 * 1024 * 1024,
+  metadataBytes: 8 * 1024 * 1024,
+  recordBytes: 8 * 1024 * 1024,
+  searchBytes: 64 * 1024 * 1024,
+  traversalNodes: 262144,
+  metadataDepth: 64,
   pageBytes: 64 * 1024,
   totalBytes: 512 * 1024,
   requests: 64,

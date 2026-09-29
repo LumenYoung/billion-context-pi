@@ -1,40 +1,65 @@
 import { randomUUID } from "node:crypto";
 import { setImmediate as yieldTurn } from "node:timers/promises";
 import { ACP_READONLY_LIMITS as limits, AcpReadonlyError, type AcpReadonlyAcquireRequest, type AcpReadonlyChunk, type AcpReadonlyLease, type AcpReadonlyPage, type AcpReadonlyPageRequest, type AcpReadonlyRecord, type AcpReadonlySnapshot, type AcpReadonlySearchRequest } from "./readonly-context.js";
+import { readonlyRecordBytes } from "./readonly-budget.js";
 import { frozenRecord, type ReadonlyCapture } from "./readonly-projection.js";
 
 interface LeaseData {
   context: readonly AcpReadonlyRecord[];
   evidence: readonly (AcpReadonlyRecord | null)[];
   targets: ReadonlyMap<string, readonly number[]>;
+  sanitize: AcpReadonlyAcquireRequest["sanitize"];
+  cache: Map<number, AcpReadonlyRecord | null | AcpReadonlyError>;
+  cacheBytes: number;
+}
+
+function sanitizeRecord(record: AcpReadonlyRecord, sanitize: AcpReadonlyAcquireRequest["sanitize"]): AcpReadonlyRecord | null {
+  let text: unknown;
+  try { text = sanitize(record); }
+  catch { throw new AcpReadonlyError("sanitizer_failed"); }
+  if (text !== null && typeof text !== "string") throw new AcpReadonlyError("sanitizer_failed");
+  if (text === null) return null;
+  const clean = { ...record, text };
+  readonlyRecordBytes(clean);
+  return frozenRecord(clean);
 }
 
 export async function sanitizeCapture(capture: ReadonlyCapture, request: AcpReadonlyAcquireRequest, check: () => void): Promise<LeaseData> {
+  const context: AcpReadonlyRecord[] = [];
   let bytes = 0;
-  let count = 0;
-  const sanitize = async (records: readonly AcpReadonlyRecord[]): Promise<(AcpReadonlyRecord | null)[]> => {
-    const result: (AcpReadonlyRecord | null)[] = [];
-    for (const record of records) {
-      if (++count % 32 === 0) await yieldTurn();
-      check();
-      let text: unknown;
-      try { text = request.sanitize(record); }
-      catch { throw new AcpReadonlyError("sanitizer_failed"); }
-      if (text !== null && typeof text !== "string") throw new AcpReadonlyError("sanitizer_failed");
-      if (text === null) { result.push(null); continue; }
-      bytes += Buffer.byteLength(text);
-      if (bytes > limits.captureBytes) throw new AcpReadonlyError("budget_exceeded");
-      const clean = frozenRecord({ ...record, text });
-      bytes += Buffer.byteLength(JSON.stringify({ ...clean, text: "" }));
-      if (bytes > limits.captureBytes) throw new AcpReadonlyError("budget_exceeded");
-      result.push(clean);
-    }
-    return result;
-  };
-  const context = (await sanitize(capture.context)).filter((record): record is AcpReadonlyRecord => record !== null);
-  const evidence = await sanitize(capture.evidence);
+  for (const [index, record] of capture.context.entries()) {
+    if (index % 32 === 0) await yieldTurn();
+    check();
+    const clean = sanitizeRecord(record, request.sanitize);
+    check();
+    if (!clean) continue;
+    bytes += readonlyRecordBytes(clean);
+    if (bytes > limits.captureBytes) throw new AcpReadonlyError("budget_exceeded");
+    context.push(clean);
+  }
   check();
-  return { context, evidence, targets: capture.targets };
+  return { context, evidence: capture.evidence, targets: capture.targets, sanitize: request.sanitize, cache: new Map(), cacheBytes: 0 };
+}
+
+function evidenceRecord(data: LeaseData, index: number, check: () => void): AcpReadonlyRecord | null {
+  check();
+  const cached = data.cache.get(index);
+  if (cached instanceof AcpReadonlyError) throw cached;
+  if (cached !== undefined) return cached;
+  const record = data.evidence[index];
+  if (!record) throw new AcpReadonlyError("budget_exceeded");
+  try {
+    const clean = sanitizeRecord(record, data.sanitize);
+    check();
+    const size = clean ? readonlyRecordBytes(clean) : 0;
+    if (size > limits.historyBytes - data.cacheBytes) throw new AcpReadonlyError("budget_exceeded");
+    data.cacheBytes += size;
+    data.cache.set(index, clean);
+    return clean;
+  } catch (error) {
+    if (error instanceof AcpReadonlyError && (error.code === "sanitizer_failed" || error.code === "budget_exceeded")) data.cache.set(index, error);
+    throw error;
+  }
 }
 
 function pageBytes(page: AcpReadonlyPage): number {
@@ -104,7 +129,7 @@ export function createReadonlyLease(snapshot: AcpReadonlySnapshot, initialData: 
       return page;
     } finally { active = false; }
   };
-  const page = (records: readonly AcpReadonlyRecord[], target: string, request: AcpReadonlyPageRequest): AcpReadonlyPage => {
+  const page = async (length: number, get: (index: number) => AcpReadonlyRecord | null, target: string, request: AcpReadonlyPageRequest, checkOperation: () => void): Promise<AcpReadonlyPage> => {
     const cap = maxBytes(request.maxBytes);
     const cursor = request.cursor ? cursors.get(request.cursor) : { target, index: 0, offset: 0 };
     if (!cursor || cursor.target !== target) throw new AcpReadonlyError("invalid_request");
@@ -112,15 +137,23 @@ export function createReadonlyLease(snapshot: AcpReadonlySnapshot, initialData: 
     const chunks: AcpReadonlyChunk[] = [];
     const nextCursor = randomUUID();
     const build = (next: boolean): AcpReadonlyPage => finishPage({ snapshotId: snapshot.id, records: chunks, ...(next ? { nextCursor } : {}), bytes: 0 });
-    while (index < records.length) {
-      const record = records[index]!;
+    while (index < length) {
+      if (index % 32 === 0) await yieldTurn();
+      checkOperation();
+      const record = get(index);
+      if (!record) { index++; offset = 0; continue; }
       const chunk = (end: number): AcpReadonlyChunk => Object.freeze({ ...record, text: record.text.slice(offset, end), offset, complete: end === record.text.length });
       const remaining = record.text.length;
-      chunks.push(chunk(remaining));
-      if (build(true).bytes <= cap) { index++; offset = 0; continue; }
+      const end = Math.min(remaining, offset + cap);
+      chunks.push(chunk(end));
+      if (build(true).bytes <= cap) {
+        if (end === remaining) { index++; offset = 0; continue; }
+        offset = end;
+        break;
+      }
       chunks.pop();
       let low = offset;
-      let high = remaining;
+      let high = end;
       while (low < high) {
         const mid = Math.ceil((low + high) / 2);
         chunks.push(chunk(mid));
@@ -137,7 +170,7 @@ export function createReadonlyLease(snapshot: AcpReadonlySnapshot, initialData: 
       offset = low;
       break;
     }
-    const hasNext = index < records.length;
+    const hasNext = index < length;
     if (hasNext) cursors.set(nextCursor, { target, index, offset });
     return build(hasNext);
   };
@@ -145,20 +178,22 @@ export function createReadonlyLease(snapshot: AcpReadonlySnapshot, initialData: 
     snapshot,
     signal: lifetime.signal,
     context(request: AcpReadonlyPageRequest = {}) {
-      return run(request, async () => {
+      return run(request, async (checkOperation) => {
         validatePage(request, ["cursor", "maxBytes", "signal"]);
-        return page(data!.context, "context", request);
+        const current = data!;
+        return page(current.context.length, (index) => current.context[index]!, "context", request, checkOperation);
       });
     },
     decompress(request: AcpReadonlyPageRequest & { readonly ref: string }) {
-      return run(request, async () => {
+      return run(request, async (checkOperation) => {
         validatePage(request, ["ref", "cursor", "maxBytes", "signal"]);
         if (typeof request.ref !== "string" || request.ref.length > 64) throw new AcpReadonlyError("invalid_request");
-        const indexes = data!.targets.get(request.ref);
+        const current = data!;
+        const indexes = current.targets.get(request.ref);
         if (!indexes) throw new AcpReadonlyError("unknown_ref");
-        const records = indexes.map((index) => data!.evidence[index]).filter((record): record is AcpReadonlyRecord => record !== null && record !== undefined);
-        if (!records.length) throw new AcpReadonlyError("unknown_ref");
-        return page(records, `ref:${request.ref}`, request);
+        const result = await page(indexes.length, (index) => evidenceRecord(current, indexes[index]!, checkOperation), `ref:${request.ref}`, request, checkOperation);
+        if (!result.records.length && !request.cursor) throw new AcpReadonlyError("unknown_ref");
+        return result;
       });
     },
     search(request: AcpReadonlySearchRequest) {
@@ -167,16 +202,22 @@ export function createReadonlyLease(snapshot: AcpReadonlySnapshot, initialData: 
         if (typeof request.query !== "string" || !request.query.trim() || request.query.length > 256 || (request.limit !== undefined && (!Number.isInteger(request.limit) || request.limit < 1 || request.limit > 20))) throw new AcpReadonlyError("invalid_request");
         const query = request.query.toLocaleLowerCase();
         const records: AcpReadonlyRecord[] = [];
-        for (let i = 0; i < data!.evidence.length; i++) {
+        const current = data!;
+        let scannedBytes = 0;
+        for (let i = 0; i < current.evidence.length; i++) {
           if (i % 32 === 0) { await yieldTurn(); checkOperation(); }
-          const record = data!.evidence[i];
+          const record = evidenceRecord(current, i, checkOperation);
           if (!record) continue;
+          scannedBytes += readonlyRecordBytes(record);
+          if (scannedBytes > limits.searchBytes) throw new AcpReadonlyError("budget_exceeded");
           const at = record.text.toLocaleLowerCase().indexOf(query);
+          checkOperation();
+          if (record.text.length >= limits.pageBytes) { await yieldTurn(); checkOperation(); }
           if (at < 0) continue;
           records.push(frozenRecord({ ...record, text: record.text.slice(Math.max(0, at - 160), at + query.length + 320) }));
           if (records.length >= (request.limit ?? 10)) break;
         }
-        const result = page(records, "search", request);
+        const result = await page(records.length, (index) => records[index]!, "search", request, checkOperation);
         if (result.nextCursor) cursors.delete(result.nextCursor);
         return finishPage({ snapshotId: snapshot.id, records: result.records, bytes: 0 });
       });
