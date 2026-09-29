@@ -114,4 +114,3 @@ export function wireReadonlyContext(pi: ExtensionAPI): ReadonlyContextBridge {
   pi.on("session_shutdown", () => { bridge.invalidate(); unsubscribe?.(); unsubscribe = undefined; });
   return bridge;
 }
-
