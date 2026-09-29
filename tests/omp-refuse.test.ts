@@ -176,6 +176,6 @@ describe("Unsupported-host refusal (issue #234 / #364)", () => {
     }
 
     assert.equal(notes.filter((m) => m === UNSUPPORTED_HOST_MESSAGE).length, 0, "no refusal when fork declared");
-    assert.deepEqual(handlers.get("session_before_compact")![0]!({}, {}), { cancel: true });
+    assert.ok(handlers.get("session_before_compact")!.some((handler) => handler({}, {})?.cancel === true));
   });
 });

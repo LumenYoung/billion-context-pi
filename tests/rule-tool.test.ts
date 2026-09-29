@@ -61,7 +61,7 @@ async function boot({ dir, sessionId, entries = [], adapter }: BootOpts) {
       getSessionFile: () => stateFile,
     },
   };
-  await handlers.get("session_start")![0]!({ type: "session_start", reason: "startup" }, ctx);
+  for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
   return { api, handlers, ctx, stateFile };
 }
 
