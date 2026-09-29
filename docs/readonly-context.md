@@ -62,8 +62,14 @@ The producer enforces these hard limits:
 
 | Limit | Value |
 | --- | --- |
-| Capture and sanitized lease accounting | 8 MiB each |
-| Captured records | 32,768 |
+| Current projection and its initial sanitization | 8 MiB each |
+| Retained immutable historical projection | 64 MiB per capture |
+| Snapshot metadata | 8 MiB per capture |
+| Individual projected or sanitized record | 8 MiB |
+| Historical sanitized-record cache | 64 MiB per lease |
+| Historical evidence scanned by one search | 64 MiB |
+| Records in a capture | 32,768 |
+| Metadata traversal | 262,144 nodes, depth 64 |
 | Page size | 1–64 KiB |
 | Returned bytes per lease | 512 KiB, including metadata |
 | Requests per lease | 64 |
@@ -73,6 +79,12 @@ The producer enforces these hard limits:
 | Acquisition and operation deadline | 5 seconds |
 | Search query | nonempty, at most 256 characters |
 | Search result limit | 1–20 |
+
+The current ACP view and historical evidence have separate capacities. A small current view can be acquired even when the captured history is too large to retain in full. Captured records and metadata remain immutable after capture; the producer does not retain mutable session objects for later projection.
+
+Historical records are sanitized lazily, as complete records, when a lease retrieves or searches them. The resulting disclosed record, a denial, or a sanitization error is cached only for that lease. An over-limit record, sanitization expansion, or exhausted historical cache fails the affected retrieval with `budget_exceeded`; a sanitizer failure uses `sanitizer_failed`. No unsanitized or partial record is substituted.
+
+The producer preserves known references for historical evidence it could not retain, but it does not fabricate placeholders. Decompressing such a reference fails with `budget_exceeded`. A search that must inspect unavailable evidence before it reaches its requested result limit also fails with `budget_exceeded`, rather than returning an incomplete result as if it were complete. Because search may stop after its requested number of results, a successful limited search does not imply that all later evidence was scanned.
 
 A consumer needs additional limits appropriate to its own model window, prompt construction, tool loop, response budget, and cancellation policy. Producer byte limits do not guarantee that every allowed page can fit in a particular model request.
 
