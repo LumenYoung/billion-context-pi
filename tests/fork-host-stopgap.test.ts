@@ -72,8 +72,9 @@ function piCtx(notify: Notify) {
   };
 }
 
-const startSession = (handlers: any, ctx: any) =>
-  handlers.get("session_start")![0]!({ type: "session_start", reason: "startup" }, ctx);
+const startSession = async (handlers: any, ctx: any) => {
+  for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, ctx);
+};
 
 describe("Fork-host stopgap (issue #454)", () => {
   test("declared fork host admits but warns once via UI at session_start", async () => {
@@ -96,7 +97,7 @@ describe("Fork-host stopgap (issue #454)", () => {
     assert.equal(forkNotes[0]!.type, "warning");
     assert.equal(notes.filter((n) => n.msg === UNSUPPORTED_HOST_MESSAGE).length, 0, "no refusal when fork declared");
     // Still serves: cancels host compaction and injects the ACP system prompt.
-    assert.deepEqual(handlers.get("session_before_compact")![0]!({}, {}), { cancel: true });
+    assert.ok(handlers.get("session_before_compact")!.some((handler) => handler({}, {})?.cancel === true));
   });
 
   test("pi host gets no fork warning even when PI_ACP_FORK_HOST is set", async () => {

@@ -972,7 +972,7 @@ test("#415: project-scope pi-subagents → acp_delegate stands down (tools, shor
         ui: { notify: (msg: string) => { notified.push(msg); }, confirm: async () => true, select: async () => undefined, input: async () => "", setStatus: () => {} },
       });
 
-      await handlers.get("session_start")![0]!({}, ctx);
+      for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
 
       const toolNames = api.tools.map((t) => t.name);
       assert.ok(!toolNames.includes("acp_delegate"), "acp_delegate not registered while stood down");
@@ -1006,7 +1006,7 @@ test("#415: user-scope-only pi-subagents → acp_delegate stays active (warning 
         ui: { notify: (msg: string) => { notified.push(msg); }, confirm: async () => true, select: async () => undefined, input: async () => "", setStatus: () => {} },
       });
 
-      await handlers.get("session_start")![0]!({}, ctx);
+      for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
 
       const toolNames = api.tools.map((t) => t.name);
       assert.ok(toolNames.includes("acp_delegate"), "a global install must not disable acp_delegate in every project");
@@ -1033,7 +1033,7 @@ test("#415: delegate.forceEnable keeps acp_delegate despite project-scope pi-sub
       const ctx = piSessionCtx(fx.tmp, fx.cwd, {
         ui: { notify: (msg: string) => { notified.push(msg); }, confirm: async () => true, select: async () => undefined, input: async () => "", setStatus: () => {} },
       });
-      await handlers.get("session_start")![0]!({}, ctx);
+      for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
 
       const toolNames = api.tools.map((t) => t.name);
       assert.ok(toolNames.includes("acp_delegate"), "acp_delegate registered with forceEnable");
@@ -1060,7 +1060,7 @@ test("#415: explicit enabled:false wins over detection and forceEnable (priority
       createAcpExtension({ delegate: { enabled: false, forceEnable: true } })(api as any);
 
       const ctx = piSessionCtx(fx.tmp, fx.cwd);
-      await handlers.get("session_start")![0]!({}, ctx);
+      for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
 
       const toolNames = api.tools.map((t) => t.name);
       assert.ok(!toolNames.includes("acp_delegate"), "explicitly disabled delegate stays off despite forceEnable");
@@ -1086,7 +1086,7 @@ test("#415: no pi-subagents → acp_delegate registers normally (regression guar
       createAcpExtension()(api as any);
 
       const ctx = piSessionCtx(fx.tmp, fx.cwd);
-      await handlers.get("session_start")![0]!({}, ctx);
+      for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
 
       const toolNames = api.tools.map((t) => t.name);
       assert.ok(toolNames.includes("acp_delegate"), "acp_delegate registered when no third-party subagent is installed");

@@ -50,7 +50,7 @@ async function setup(order, evidence) {
   const args = { content: [{ startId: ref, endId: ref, summary: "A safe summary of offline evidence collected by the Executor for the ongoing task." }] };
   manager.appendMessage(assistant([{ type: "toolCall", id: "compress-test", name: "compress", arguments: args }]));
   const compressed = await runner.getToolDefinition("compress").execute("compress-test", args, new AbortController().signal, undefined, runner.createContext());
-  assert.match(JSON.stringify(compressed), /1 block/);
+  assert.match(JSON.stringify(compressed), /blocks: b1=/);
   assert.ok(!JSON.stringify(compressed).includes("Error:"), JSON.stringify(compressed));
   manager.appendMessage(toolResult("compress", "compress-test", compressed.content.map((part) => part.text ?? "").join("\n")));
   const output = await context();
