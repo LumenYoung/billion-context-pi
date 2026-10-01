@@ -2,9 +2,9 @@ name: CI
 
 on:
   pull_request:
-    branches: [master]
+    branches: [master, integrate/upstream-0.1.82-20260929]
   push:
-    branches: [master]
+    branches: [master, integrate/upstream-0.1.82-20260929]
 
 jobs:
   test:
@@ -21,11 +21,24 @@ jobs:
           node-version: ${{ matrix.node-version }}
           registry-url: https://registry.npmjs.org
           cache: npm
+      # Test the committed release before a development build can repair it.
+      - name: Install committed production artifacts
+        shell: bash
+        run: |
+          test -n "$(git ls-files -- dist)"
+          npm install --omit=dev --legacy-peer-deps --package-lock=false
       - run: npm ci
       - run: npm run typecheck
       # build before test: tests/host-api.test.ts resolves "billion-context-pi"
       # via Node self-reference to dist/index.js (package-name-only import contract)
       - run: npm run build
+      # Git release commits carry prebuilt artifacts for production-only installs.
+      - name: Verify complete, fresh committed artifacts
+        shell: bash
+        run: |
+          git status --short --untracked-files=all -- dist
+          test -z "$(git status --porcelain --untracked-files=all -- dist)"
+      - run: npm run test:packaging
       - run: npm test
 
   pr-validation:

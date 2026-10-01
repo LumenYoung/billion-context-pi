@@ -1,1 +1,4 @@
+# Stable source-map contents and build outputs across Linux and Windows.
+src/** text eol=lf
+dist/** text eol=lf
 tests/fixtures/** -text

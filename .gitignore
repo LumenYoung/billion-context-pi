@@ -1,5 +1,5 @@
 node_modules/
-dist/
+# Prebuilt dist is tracked so Pi's production-only Git installs need no compiler.
 *.log
 .DS_Store
 *.acp.json
