@@ -475,8 +475,21 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // it (issue #325, floor-stale.ts) instead of skipping the floor entirely —
       // the skip dropped the meter onto the undercounting estimate (~70-80K low)
       // and the next fresh reading snapped it back into the emergency band.
-      const { predates, netReclaimed } = compressionAnchorStaleness(entries, state.blocks, defaultCountTokens);
-      const realPromptTokens = realUsage?.tokens ?? 0;
+      const { predates, netReclaimed, fresh, lastRealTokens } = compressionAnchorStaleness(entries, state.blocks, defaultCountTokens);
+      // issue #600: when the previous model turn yielded no fresh provider usage
+      // (errored / aborted / zero-usage — e.g. a network "fetch failed"), the host's
+      // getContextUsage() has no anchor and reports the raw session-tree total
+      // (uncompressed, only grows). Flooring at that transient inflation drags the
+      // raise-only meter into the emergency band and drives redundant compresses
+      // (each "recovers" once a fresh reading lands). Reject it: floor at the last
+      // REAL provider reading instead, and suspend the downward calibration below —
+      // a stale reading must not cap the current estimate down, or growth since
+      // that reading would be hidden. Fresh turns take this path unchanged.
+      const reportedHost = realUsage?.tokens ?? 0;
+      const realPromptTokens = fresh ? reportedHost : lastRealTokens;
+      if (!fresh && reportedHost > 0) {
+        logInfo("turn", { sid, event: "host-tree-sum-rejected", reported: reportedHost, flooredAt: lastRealTokens });
+      }
       const hostFloor = realPromptTokens > 0 ? Math.max(0, realPromptTokens - (predates ? netReclaimed : 0)) : 0;
       // Calibration anchor (issue #455): the estimate carries systematic phantom
       // mass (content counted locally that never goes on the wire) which the
@@ -488,7 +501,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // pre-send prediction for growth beyond the lagged-by-one-response
       // measurement. Stale or jittering measurements fall back to the raw
       // estimate; the divergence watch below keeps that fallback visible.
-      const hostUsageStable = !predates && realPromptTokens > 0 ? runtime.noteHostUsage(sid, realPromptTokens) : false;
+      const hostUsageStable = fresh && !predates && realPromptTokens > 0 ? runtime.noteHostUsage(sid, realPromptTokens) : false;
       const calibrate = (base: number): number =>
         hostUsageStable ? Math.min(base, Math.ceil(realPromptTokens * 1.2)) : base;
       const applyFloors = (base: number): number => Math.max(calibrate(base), hostFloor, armedFloor);
@@ -536,7 +549,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // episode instead of silently driving every threshold off the wrong ruler.
       // With calibration engaged the capped tokenCount stays within 20% of the
       // measurement, so this only fires in the fallback states it diagnoses.
-      const sizeDivergent = !predates && realPromptTokens > 0 && Math.abs(tokenCount - realPromptTokens) / realPromptTokens > 0.5;
+      const sizeDivergent = fresh && !predates && realPromptTokens > 0 && Math.abs(tokenCount - realPromptTokens) / realPromptTokens > 0.5;
       if (runtime.noteSizeDivergence(sid, sizeDivergent)) {
         logWarn("turn", { sid, event: "size-divergence", est: tokenCount, host: realPromptTokens, ratio: Number((tokenCount / realPromptTokens).toFixed(2)), stable: hostUsageStable });
       }
