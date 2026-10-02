@@ -42,7 +42,8 @@ function msg(id: string, role: string, text: string) {
 // effective and nudged legitimately, masking the host-floor variable), while the
 // pending mass must stay ABOVE minPressureBenefit (max(5K, 1% of window)) so an
 // un-fixed meter dragged to the inflated tree-sum still injects and fails this
-// test. 1800 repeats lands at ~54K est / ~31.5K effective — inside the band.
+// test. Measured with 1800 repeats: ~54K est / ~40.5K effective compressible —
+// inside the band (verified red against master's index.ts, green with the fix).
 const MID = "lorem ".repeat(1800);
 
 let branchEntries: any[] = [];
