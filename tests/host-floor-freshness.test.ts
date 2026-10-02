@@ -10,6 +10,8 @@ import { tmpPath } from "./tmp-path.js";
 // floor the raise-only meter into the emergency band and drive a redundant compress
 // on every flaky turn. The meter must reject the tree-sum and floor at the last
 // REAL provider reading instead; the fresh-turn floor path (#257/#325) stays intact.
+// (The no-anchor-at-all fallback — trusting the tree-sum because nothing has been
+// compressed yet — is pinned by tests/terminal-escape.test.ts.)
 
 const STATE_FILE = tmpPath("pai-acp-host-floor-freshness.session.json");
 
@@ -33,7 +35,15 @@ function msg(id: string, role: string, text: string) {
   return { type: "message", id, parentId: null, timestamp: "", message: { role, content: text, timestamp: Date.now() } };
 }
 
-const MID = "lorem ".repeat(3000);
+// Sized so ONLY the host floor can drive a nudge here. Two kernel bounds pin the
+// band (180K window): the estimate's effective compressible mass must stay BELOW
+// the flat 50K nudge-growth floor (else the first-sight-mass T1 branch fires on
+// the bulk alone — the original 3000-repeat sizing measured 90K est / 67.5K
+// effective and nudged legitimately, masking the host-floor variable), while the
+// pending mass must stay ABOVE minPressureBenefit (max(5K, 1% of window)) so an
+// un-fixed meter dragged to the inflated tree-sum still injects and fails this
+// test. 1800 repeats lands at ~54K est / ~31.5K effective — inside the band.
+const MID = "lorem ".repeat(1800);
 
 let branchEntries: any[] = [];
 
@@ -58,9 +68,6 @@ const fire = (handlers: Map<string, ((e: any, ctx: any) => any)[]>, entries: any
 const nudgeCount = (r: any) =>
   (r?.messages ?? []).filter((m: any) => m.role === "user" && /Context limit reached|compress/i.test(JSON.stringify(m.content))).length;
 
-// Base stream: enough MID bulk to give the kernel ready mass, but an estimate
-// (~42%) below the 45% first-sight-mass bypass floor so ONLY the host floor can
-// drive a nudge here — mirroring sent-view-arbitration's sizing.
 const baseStream = (): any[] => {
   const entries = [msg("e0", "user", "start " + MID)];
   for (let i = 1; i <= 17; i++) entries.push(msg(`e${i}`, i % 2 ? "assistant" : "user", `f${i} ` + MID));
