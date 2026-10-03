@@ -259,6 +259,7 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     runtime.throttleFor(ctx.sessionManager.getSessionId()).reset();
     runtime.clearCompressRetryTracking(ctx.sessionManager.getSessionId());
     runtime.dropHostUsageSamples(ctx.sessionManager.getSessionId());
+    runtime.dropKhat(ctx.sessionManager.getSessionId());
     runtime.dropSizeDivergence(ctx.sessionManager.getSessionId());
     runtime.dropTerminalEscape(ctx.sessionManager.getSessionId());
     runtime.dropTruncationSkipped(ctx.sessionManager.getSessionId());
@@ -356,6 +357,7 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
     runtime.clearNudgeTracking(sid);
     runtime.clearCompressRetryTracking(sid);
     runtime.dropHostUsageSamples(sid);
+    runtime.dropKhat(sid);
     runtime.dropSizeDivergence(sid);
     runtime.dropTerminalEscape(sid);
     runtime.dropTruncationSkipped(sid);
@@ -489,8 +491,21 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // measurement. Stale or jittering measurements fall back to the raw
       // estimate; the divergence watch below keeps that fallback visible.
       const hostUsageStable = !predates && realPromptTokens > 0 ? runtime.noteHostUsage(sid, realPromptTokens) : false;
+      // k̂ calibration (#598 root fix, borrowed from billion-context#1940 F1):
+      // the usage report that just arrived settles the PREVIOUS request — pair
+      // it with the estimate recorded for that request to learn the
+      // local→provider ratio (deflate-only, published only when two settled
+      // samples agree). A published k̂ replaces the ×1.2 cap as the meter's
+      // ruler: one learned continuous ruler instead of two raw ones
+      // max-arbitrated, so equality-line jitter stops pretending to be a scale
+      // change. scaleChanged (model switch, publish, disagreement clear) is
+      // the genuine transition the growth guard re-anchors on below.
+      const khatReport = realPromptTokens > 0
+        ? runtime.noteKhatUsage(sid, modelId, realPromptTokens)
+        : { khat: runtime.khatFor(sid, modelId), scaleChanged: false };
       const calibrate = (base: number): number =>
-        hostUsageStable ? Math.min(base, Math.ceil(realPromptTokens * 1.2)) : base;
+        khatReport.khat !== null ? Math.ceil(base * khatReport.khat)
+          : hostUsageStable ? Math.min(base, Math.ceil(realPromptTokens * 1.2)) : base;
       const applyFloors = (base: number): number => Math.max(calibrate(base), hostFloor, armedFloor);
       // Basis for the no-body-4xx overflow guard (wireOverflowSelfHeal): the
       // sent-view estimate of the request about to be sent, on the same scale
@@ -540,11 +555,13 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       if (runtime.noteSizeDivergence(sid, sizeDivergent)) {
         logWarn("turn", { sid, event: "size-divergence", est: tokenCount, host: realPromptTokens, ratio: Number((tokenCount / realPromptTokens).toFixed(2)), stable: hostUsageStable });
       }
-      // Growth scale guard (issue #267, re-anchored in #455): the meter switches
-      // rulers when the dominant source flips between the provider floor and the
-      // local estimate (hostFloor vs sentTokens, not raw staleness — a stale anchor
-      // whose adjusted floor still dominates is not a switch, #325). A growth delta
-      // spanning that switch is a false artifact, not real growth.
+      // Growth scale guard (issue #267, re-anchored in #455, hysteresis in #598):
+      // the meter switches rulers when one ruler clearly overtakes the other
+      // (hostFloor vs sentTokens, not raw staleness — a stale anchor whose adjusted
+      // floor still dominates is not a switch, #325). A growth delta spanning that
+      // switch is a false artifact, not real growth. Near-tied rulers jitter across
+      // the equality line turn-to-turn; without the dead-band every micro-crossing
+      // re-anchored the baselines and growth could never reach growthFloor (#598).
       // Zeroing the baselines (the original fix) re-armed the kernel's one-shot
       // first-sight-mass bypass on EVERY flip (it requires
       // lastNudgeShownTokens === 0 && baseline === 0) — flips happen twice per
@@ -554,7 +571,11 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // reference resets to zero, cadence baselines stay meaningful on the new
       // ruler, and the mass bypass keeps its consumed state. Genuine cold starts
       // (references already 0) are untouched and keep their one-shot.
-      if (runtime.noteTokenScale(sid, hostFloor <= sentTokens)) {
+      // With a published k̂ (root fix for #598) the meter runs on one learned
+      // ruler and the dead-band tracks its calibrated base; the flip then only
+      // fires while k̂ is unpublished or mid-relearn.
+      const estFlipped = runtime.noteTokenScale(sid, hostFloor, calibrate(sentTokens));
+      if (khatReport.scaleChanged || estFlipped) {
         state.nudge.lastNudgeShownTokens = state.nudge.lastNudgeShownTokens > 0 ? tokenCount : 0;
         state.nudge.lastPerMessageNudgeTokens = state.nudge.lastPerMessageNudgeTokens > 0 ? tokenCount : 0;
         const reanchored: Record<number, number> = {};
@@ -563,7 +584,7 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
         }
         state.nudge.lastShownByTier = reanchored;
         runtime.clearNudgeTokenStamps(sid);
-        logInfo("growth-scale", { sid, event: "scale-flip-reanchor", estScaleWins: hostFloor <= sentTokens, predates, tokenCount });
+        logInfo("growth-scale", { sid, event: "scale-flip-reanchor", source: khatReport.scaleChanged ? "khat" : "dead-band", khat: khatReport.khat, estScaleWins: sentTokens >= hostFloor, predates, hostFloor, sentTokens, tokenCount });
       }
       debug.event("context-in", {
         sid,
@@ -587,13 +608,19 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime, standDownIf
       // processTurn above stay on the resync-only path. Unusable when this turn
       // ran in the truncate band (output may be post-truncation → under-reports).
       const truncateBand = config.modelContextLimit > 0 ? Math.floor(config.truncate.threshold * config.modelContextLimit) : Number.MAX_SAFE_INTEGER;
+      const sentViewTokens = estimateTokens(turn.messages, collectCoveredMessageIds(turn.state), imageTokens) + systemPromptTokens;
       runtime.noteSentViewCount(sid, {
-        viewTokens: estimateTokens(turn.messages, collectCoveredMessageIds(turn.state), imageTokens) + systemPromptTokens,
+        viewTokens: sentViewTokens,
         blocksLen: turn.state.blocks.length,
         activeBlocks: turn.state.blocks.filter((b) => b.active).length,
         limit: config.modelContextLimit,
         usable: tokenCount < truncateBand,
       });
+      // k̂ pairing source: the EXACT view that just went out is the estimate
+      // the next usage report settles. Skip when this turn ran in the truncate
+      // band — the provider saw a post-truncation request and pairing would
+      // learn garbage (same reason `usable` above is false).
+      if (tokenCount < truncateBand) runtime.setKhatPending(sid, modelId, sentViewTokens);
 
       // [#464] Surface the kernel's end-game observability signals: they fire
       // every stuck turn inside the kernel, but before this were invisible —
