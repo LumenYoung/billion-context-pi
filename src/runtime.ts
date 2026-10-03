@@ -95,6 +95,18 @@ export interface AcpRuntime {
    *  Near-tied rulers jittering inside the band do NOT report a flip (#598).
    *  The first observation for a session never reports a flip. */
   noteTokenScale: (sid: string, hostFloor: number, sentTokens: number) => boolean;
+  /** Settle the previous request's pending estimate against the usage that
+   *  arrived for it; learn/publish/clear the k̂ calibration factor. Returns
+   *  the current k̂ (null while unpublished) and whether the meter's ruler
+   *  just changed (model switch, k̂ publish or disagreement clear) — the
+   *  caller re-anchors growth baselines on that transition (#598 root fix). */
+  noteKhatUsage: (sid: string, model: string, usageTokens: number) => { khat: number | null; scaleChanged: boolean };
+  /** Current published k̂ for the session+model, or null. */
+  khatFor: (sid: string, model: string) => number | null;
+  /** Record the estimate of the request being assembled; settled next turn. */
+  setKhatPending: (sid: string, model: string, estimate: number) => void;
+  /** Drop a session's k̂ calibration state (session_shutdown). */
+  dropKhat: (sid: string) => void;
   /** Drop a session's token-scale tracker (session_shutdown). */
   dropTokenScale: (sid: string) => void;
   store: SessionStateStore;
@@ -524,6 +536,105 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
     hostUsageSamples.delete(sid);
   }
 
+  // [#598 root fix] Calibration factor (k̂) between the local sent-view
+  // estimate and the provider's reported usage — the same two-rulers disease
+  // the dead-band above only tolerates. Usage reports are anchored on the
+  // previous assistant response, so pairing is delayed by one turn: each turn
+  // records the estimate of the request being assembled, and the next turn's
+  // usage report settles it. Robustness follows billion-context#1940 F1:
+  // plausibility admission, a 3-sample ring, publish only when two samples
+  // agree within ×2, deflate-only clamp, clear on disagreement or model
+  // switch. A published k̂ replaces the ×1.2 hard cap: the meter runs on one
+  // learned ruler instead of max-arbitration between two raw ones, so the
+  // ruler-crossing flip stops being the scale signal — real transitions
+  // (model switch, k̂ publish/clear) are.
+  const KHAT_RING_MAX = 3;
+  const KHAT_MIN_ESTIMATE = 2000;
+  const KHAT_RATIO_MIN = 0.2;
+  const KHAT_RATIO_MAX = 5;
+  const KHAT_AGREE_FACTOR = 2;
+  const KHAT_CLAMP_MIN = 0.25;
+  const KHAT_CLAMP_MAX = 1;
+  // A k̂ publish/clear/model-switch only counts as a scale change when it
+  // shifts the meter's multiplicative factor by more than this — same band
+  // ratio as the dead-band (SCALE_FLIP_BAND_RATIO), so a k̂ ≈ 1 transition is
+  // a no-op for the baselines (jitter must not re-anchor, #598) while a real
+  // #267-scale mis-estimate (k̂ ≈ 0.5-0.67) still does.
+  const KHAT_SCALE_SHIFT = 0.1;
+  type KhatPending = { est: number; model: string };
+  type KhatState = { model: string; pending: KhatPending | null; ring: number[]; published: number | null };
+  const khatStates = new Map<string, KhatState>();
+  function khatFor(sid: string, model: string): number | null {
+    const st = khatStates.get(sid);
+    return st && st.model === model ? st.published : null;
+  }
+  function noteKhatUsage(sid: string, model: string, usageTokens: number): { khat: number | null; scaleChanged: boolean } {
+    let st = khatStates.get(sid);
+    let scaleChanged = false;
+    if (!st) {
+      st = { model, pending: null, ring: [], published: null };
+      khatStates.set(sid, st);
+    } else if (st.model !== model) {
+      // Model switch: fresh state; the meter's factor goes from the old k̂ back
+      // to 1 — a material transition only if the old k̂ was materially < 1.
+      const prevFactor = st.published ?? 1;
+      if (1 - prevFactor > KHAT_SCALE_SHIFT) scaleChanged = true;
+      st = { model, pending: null, ring: [], published: null };
+      khatStates.set(sid, st);
+    }
+    const before = st.published;
+    const pending = st.pending;
+    st.pending = null;
+    if (pending && pending.model === model && pending.est >= KHAT_MIN_ESTIMATE && usageTokens > 0) {
+      const ratio = usageTokens / pending.est;
+      if (ratio >= KHAT_RATIO_MIN && ratio <= KHAT_RATIO_MAX) {
+        const sample = Math.min(Math.max(ratio, KHAT_CLAMP_MIN), KHAT_CLAMP_MAX);
+        if (st.published !== null) {
+          // Sticky until a fresh sample disagrees beyond the publish window:
+          // the local→provider ratio itself moved (content mix, tokenizer),
+          // so the meter's ruler must be relearned from scratch.
+          if (sample / st.published > KHAT_AGREE_FACTOR || st.published / sample > KHAT_AGREE_FACTOR) {
+            st.ring = [sample];
+            st.published = null;
+          }
+        } else {
+          st.ring.push(sample);
+          if (st.ring.length > KHAT_RING_MAX) st.ring.shift();
+          for (let i = 0; i < st.ring.length && st.published === null; i++) {
+            for (let j = i + 1; j < st.ring.length; j++) {
+              const a = st.ring[i]!;
+              const b = st.ring[j]!;
+              if (a / b <= KHAT_AGREE_FACTOR && b / a <= KHAT_AGREE_FACTOR) {
+                st.published = (a + b) / 2;
+                st.ring = [st.published];
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+    // Material-transition gate: compare the meter's multiplicative factor
+    // before vs after (1 stands in for "no k̂ in force"). A k̂ that lands near
+    // 1 changed nothing the baselines care about; the dead-band keeps guarding
+    // that regime. Only a >10% factor shift re-anchors (#267 semantics).
+    const factorBefore = before ?? 1;
+    const factorAfter = st.published ?? 1;
+    if (Math.abs(factorBefore - factorAfter) > KHAT_SCALE_SHIFT) scaleChanged = true;
+    return { khat: st.published, scaleChanged };
+  }
+  function setKhatPending(sid: string, model: string, estimate: number): void {
+    const st = khatStates.get(sid);
+    if (!st || st.model !== model) {
+      khatStates.set(sid, { model, pending: { est: estimate, model }, ring: [], published: null });
+      return;
+    }
+    st.pending = { est: estimate, model };
+  }
+  function dropKhat(sid: string): void {
+    khatStates.delete(sid);
+  }
+
   // [#455] Persistent >2x internal-vs-provider disagreement, one warn per
   // episode: fires on the third consecutive divergent turn, resets when the
   // rulers converge or the session ends.
@@ -807,4 +918,4 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
   let refused = false;
   let refusalMessage: string | null = null;
   let delegateStoodDown = false;
-  return { core, store, get refused() { return refused; }, set refused(v: boolean) { refused = v; }, get refusalMessage() { return refusalMessage; }, set refusalMessage(v: string | null) { refusalMessage = v; }, get delegateStoodDown() { return delegateStoodDown; }, set delegateStoodDown(v: boolean) { delegateStoodDown = v; }, get adapter() { return adapterRef; }, setAdapter: (a) => { adapterRef = a; }, get prompts() { return promptsRef; }, setPrompts: (p) => { promptsRef = p; }, markNudgeShown, nudgeShownFor, nudgeShownTokensFor, clearNudgeTracking, clearNudgeTokenStamps, markNudgeRecorded, nudgeRecordedFor, noteCompressOutcomes, compressRetryCappedFor, clearCompressRetryTracking, liveContextLimit, configFor, reasoningDropFor, reloadConfig, stateFor, save, deriveChildState: deriveChild, acquireLock, overflowFor, overflowDrop, noteSentViewCount, peekSentViewCount, dropSentViewCount, dropProjectionCache, noteDeadCompress, clearDeadCompress, throttleFor, throttleDrop , noteTokenScale, dropTokenScale, noteHostUsage, dropHostUsageSamples, noteSizeDivergence, dropSizeDivergence, noteTerminalEscape, dropTerminalEscape, noteTruncationSkipped, dropTruncationSkipped, stripImagesFor };}
+  return { core, store, get refused() { return refused; }, set refused(v: boolean) { refused = v; }, get refusalMessage() { return refusalMessage; }, set refusalMessage(v: string | null) { refusalMessage = v; }, get delegateStoodDown() { return delegateStoodDown; }, set delegateStoodDown(v: boolean) { delegateStoodDown = v; }, get adapter() { return adapterRef; }, setAdapter: (a) => { adapterRef = a; }, get prompts() { return promptsRef; }, setPrompts: (p) => { promptsRef = p; }, markNudgeShown, nudgeShownFor, nudgeShownTokensFor, clearNudgeTracking, clearNudgeTokenStamps, markNudgeRecorded, nudgeRecordedFor, noteCompressOutcomes, compressRetryCappedFor, clearCompressRetryTracking, liveContextLimit, configFor, reasoningDropFor, reloadConfig, stateFor, save, deriveChildState: deriveChild, acquireLock, overflowFor, overflowDrop, noteSentViewCount, peekSentViewCount, dropSentViewCount, dropProjectionCache, noteDeadCompress, clearDeadCompress, throttleFor, throttleDrop , noteTokenScale, dropTokenScale, noteKhatUsage, khatFor, setKhatPending, dropKhat, noteHostUsage, dropHostUsageSamples, noteSizeDivergence, dropSizeDivergence, noteTerminalEscape, dropTerminalEscape, noteTruncationSkipped, dropTruncationSkipped, stripImagesFor };}
