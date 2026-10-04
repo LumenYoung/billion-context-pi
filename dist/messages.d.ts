@@ -13,6 +13,13 @@ export declare const ACP_EXPORT_CUSTOM_TYPE = "acp-export";
  *  reach the model through the feature's own channel, so the human-facing
  *  report must never be re-billed as model context. */
 export declare const ACP_RULE_CUSTOM_TYPE = "acp-rule";
+/** Nudge persistence record (issue #326): written via pi.appendEntry as a
+ *  type:"custom" entry — never projected into the sent view (see above), so
+ *  the compact one-liner stays out of model context while surviving restarts. */
+export declare const ACP_NUDGE_CUSTOM_TYPE = "acp-nudge";
+export interface AcpNudgeRecord {
+    text: string;
+}
 /** True for host-injected custom_message entries that participate in LLM
  *  context: non-empty custom_message except the UI-only types in
  *  CONTEXT_EXCLUDED_CUSTOM_TYPES (acp-status panels, acp-export docs,

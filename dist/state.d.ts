@@ -1,4 +1,5 @@
 import { type CompressionState } from "acp-kernel";
+export declare const STATE_SUFFIX = ".acp.json";
 export interface LiveRefOrigin {
     rawId: string;
     identity: string;
@@ -38,3 +39,4 @@ export declare class SessionStateStore {
  *  use this: their session files carry a parentSession header that already
  *  inherits the parent state verbatim. */
 export declare function deriveChildState(parent: CompressionState): CompressionState;
+export declare function parseLiveRefOrigins(value: unknown): LiveRefOrigin[];

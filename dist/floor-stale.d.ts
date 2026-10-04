@@ -26,6 +26,8 @@ export declare function usageAnchorPredatesCompression(entries: AnchorEntry[]): 
 export interface AnchorStaleness {
     predates: boolean;
     netReclaimed: number;
+    fresh: boolean;
+    lastRealTokens: number;
 }
 export declare function compressionAnchorStaleness(entries: AnchorEntry[], blocks: readonly CompressionBlock[], countTokens: (text: string) => number): AnchorStaleness;
 export {};

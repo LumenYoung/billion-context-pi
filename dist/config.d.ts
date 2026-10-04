@@ -378,9 +378,19 @@ export interface HostSessionConfig {
     /** Count host-injected custom_message entries (agent_message) as turn
      *  boundaries. Default: false (pi-native behavior). */
     countCustomMessages?: boolean;
+    /** #578: optional customType allowlist refining countCustomMessages — when
+     *  set (with countCustomMessages:true), only injected entries whose
+     *  customType is listed start a turn, keeping metadata injections
+     *  (harness_digest, ipython_state) out of nudge/retry accounting. Ignored
+     *  unless countCustomMessages:true; malformed values warn and fall back to
+     *  "all injected types count". */
+    customMessageTypes?: string[];
 }
 export interface ResolvedHostSession {
     countCustomMessages: boolean;
+    /** Present only when countCustomMessages is on and a valid allowlist was
+     *  configured (#578). */
+    customMessageTypes?: readonly string[];
 }
 /** Resolve the host-session turn-boundary policy from the adapter, handling
  *  the boolean shorthand (`true` enables countCustomMessages). Invalid values

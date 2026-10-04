@@ -10,3 +10,14 @@ export declare function parseSessionLog(text: string): SessionEntry[];
  *  returns entries whose base id is in `wantedBaseIds`. The starting session
  *  itself is never included; nearest-ancestor entries win on duplicate ids. */
 export declare function loadAncestorEntries(sessionFile: string | undefined, wantedBaseIds: Set<string>): Promise<SessionEntry[]>;
+/** Read-only content recovery for content-addressed `live-*` refs (issue
+ *  #579): fork hosts alias not-yet-persisted tail messages with `live-*` ids
+ *  (runtime.ts mergeLiveEntries); those aliases appear in NO jsonl, so the
+ *  entry-id lookup above can never find them. The rawId→identity bridge lives
+ *  in each session's OWN sidecar (liveRefOrigins). Walks the chain — itself
+ *  first, then ancestors, same depth/cycle rules as loadAncestorEntries — and
+ *  at each level pairs that level's declared origins with that same level's
+ *  log entries matched by messageIdentity. First matching entry wins per rawId
+ *  (identical identities are interchangeable: identity covers full normalized
+ *  content). Never writes any sidecar. */
+export declare function loadLiveRefEntries(sessionFile: string | undefined, wantedRawIds: Set<string>): Promise<Map<string, SessionEntry>>;
